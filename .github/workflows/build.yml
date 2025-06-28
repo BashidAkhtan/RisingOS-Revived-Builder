@@ -118,14 +118,63 @@ jobs:
           git commit -m "Update workflow run count for device ${{ inputs.CODENAME }}"
           git push
 
-  build:
+  # NEW JOB: Check Self-Hosted Runner Availability via API
+  check_runner_availability:
     needs: check-limit
-    if: ${{ needs.check-limit.outputs.authorized == 'true' }}
-    runs-on: self-hosted
-    timeout-minutes: 1
-    continue-on-error: true
+    # This job only needs to run if the user is authorized and limits are not reached,
+    # otherwise, we'd skip the build anyway.
+    if: ${{ needs.check-limit.outputs.authorized == 'true'}}
+    runs-on: ubuntu-latest # This job runs on GitHub-hosted runners
     outputs:
-      self_hosted_build_succeeded: ${{ job.status == 'success' }}
+      runner_available: ${{ steps.check_api.outputs.runner_found }}
+    steps:
+      - name: Check Self-Hosted Runner Status via API
+        id: check_api
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }} # Or GITHUB_TOKEN if repo-level scope is enough for runners:read
+        run: |
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          # Get all runners for the repository or organization/enterprise
+          # For a repository, use /repos/{owner}/{repo}/actions/runners
+          # For an organization, use /orgs/{org}/actions/runners
+          # You can specify labels for filtering, e.g., &labels=self-hosted,aosp-builder
+          
+          # Adjust the API endpoint based on whether your runners are repo-level or org-level
+          # For repository-level runners (common setup):
+          RUNNERS_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/actions/runners"
+          
+          # For organization-level runners (if your runners are configured under an organization):
+          # ORGANIZATION="${REPO_OWNER}" # Assuming owner is the org
+          # RUNNERS_URL="https://api.github.com/orgs/${ORGANIZATION}/actions/runners"
+
+
+          # Filter by labels and status
+          AVAILABLE_RUNNERS=$(curl -s -H "Accept: application/vnd.github+json" \
+                                   -H "Authorization: token $GITHUB_TOKEN" \
+                                   "${RUNNERS_URL}?status=online&labels=self-hosted,aosp-builder" | \
+                                   jq '.runners[] | select(.status=="online" and (.labels | map(.name) | contains(["self-hosted", "aosp-builder"])))')
+
+          if [[ -z "$AVAILABLE_RUNNERS" ]]; then
+            echo "No online self-hosted runners with labels 'self-hosted, aosp-builder' found."
+            echo "runner_found=false" >> $GITHUB_OUTPUT
+          else
+            echo "Found at least one online self-hosted runner with labels 'self-hosted, aosp-builder'."
+            echo "runner_found=true" >> $GITHUB_OUTPUT
+            # Optional: Print details of found runners for debugging
+            echo "Available Runners: $AVAILABLE_RUNNERS"
+          fi
+
+  build:
+    needs: [check-limit, check_runner_availability] # Now depends on runner availability check
+    # Only run the build if authorized, limit not reached, AND a runner is available.
+    if: |
+      ${{ needs.check-limit.outputs.authorized == 'true' && !needs.check-limit.outputs.limit_reached }} &&
+      ${{ needs.check_runner_availability.outputs.runner_available == 'true' }}
+    runs-on: self-hosted
+    continue-on-error: true # Crucial: Allows the workflow to continue if self-hosted fails/unavailable
+    outputs:
+      self_hosted_build_succeeded: ${{ job.status == 'success' }} 
 
     env:
       BRAND: ${{ inputs.BRAND }}
@@ -248,7 +297,7 @@ jobs:
           bash telegram_notify.sh "$MESSAGE4" "$BOT_TOKEN" "$CHAT_ID" "$THREAD_ID"
 
   fallback_crave_build:
-    needs: [check-limit, build]
+    needs: [check-limit, check_runner_availability, build] # Now depends on new runner check job
     if: |
       (always() && needs.build.result != 'success')
     runs-on: ubuntu-latest
