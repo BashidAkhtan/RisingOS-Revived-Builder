@@ -41,6 +41,8 @@ jobs:
     outputs:
       authorized: ${{ steps.check_user.outputs.authorized }}
       core: ${{ steps.check_user.outputs.core }}
+      # IMPORTANT: Add limit_reached back to outputs!
+      limit_reached: ${{ steps.set_limit_reached_output.outputs.limit_reached_status }} 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -70,8 +72,8 @@ jobs:
           fi
 
       - name: Check Builds Limit
-        id: check_limit
-        if: ${{ steps.check_user.outputs.authorized == 'true' }}
+        id: check_limit_step # Renamed to avoid confusion and use as a step ID
+        if: ${{ steps.check_user.outputs.authorized == 'true' }} # Only run if user is authorized
         run: |
           echo "Debugging: core output is: '${{ steps.check_user.outputs.core }}'"
           COUNTER_FILE=".github/workflow_counter.json"
@@ -99,17 +101,31 @@ jobs:
 
           if [[ $LIMIT -ne -1 && "$TODAY_RUNS" -ge $LIMIT ]]; then
             echo "Device $DEVICE has reached the daily limit of $LIMIT workflow runs."
-            exit 1
+            echo "::error::Daily build limit reached for device ${{ inputs.CODENAME }}."
+            exit 1 # Fail this step if limit is reached
           fi
-
+          
+          # Only increment if limit is NOT reached
           NEW_RUNS=$((TODAY_RUNS + 1))
-          jq --arg device "$DEVICE" --arg date "$CURRENT_DATE" --argjson runs "$NEW_RUNS" \
+          jq --arg device "$DEVICE" --arg date "$CURRENT_DATE" --argjson runs "$NEW_RUN00S" \
             'del(.[$device]) | .[$device][$date] = $runs' "$COUNTER_FILE" > tmp.json && mv tmp.json "$COUNTER_FILE"
 
           echo "Updated run count for device $DEVICE: $NEW_RUNS"
 
+      # NEW STEP: Set Job Limit Reached Output explicitly based on check_limit_step outcome
+      - name: Set Job Limit Reached Output
+        id: set_limit_reached_output
+        run: |
+          LIMIT_STATUS="false" 
+          # If check_limit_step failed (due to exit 1 for limit reached), set status to true
+          if [[ "${{ steps.check_limit_step.outcome }}" == "failure" ]]; then
+            LIMIT_STATUS="true"
+          fi
+          echo "limit_reached_status=${LIMIT_STATUS}" >> $GITHUB_OUTPUT
+
       - name: Commit and push counter update
-        if: ${{ steps.check_limit.outcome == 'success' }}
+        # Only commit if the limit check was successful (i.e., not a failure)
+        if: ${{ steps.check_limit_step.outcome == 'success' }}
         run: |
           COUNTER_FILE=".github/workflow_counter.json"
           git config --global user.email "actions@github.com"
@@ -118,10 +134,11 @@ jobs:
           git commit -m "Update workflow run count for device ${{ inputs.CODENAME }}"
           git push
 
-  # NEW JOB: Check Self-Hosted Runner Availability via API
+  # Check Self-Hosted Runner Availability via API
   check_runner_availability:
     needs: check-limit
-    if: ${{ needs.check-limit.outputs.authorized == 'true' }}
+    # Only check runner availability if user is authorized AND limit is NOT reached
+    if: ${{ needs.check-limit.outputs.authorized == 'true' && needs.check-limit.outputs.limit_reached == 'false' }}
     runs-on: ubuntu-latest
     outputs:
       runner_available: ${{ steps.check_api.outputs.runner_found }}
@@ -162,11 +179,14 @@ jobs:
             echo "API Response does not contain a valid 'runners' array or is not valid JSON. This could indicate insufficient token permissions or an incorrect API URL."
             echo "runner_found=false" >> $GITHUB_OUTPUT
           fi
+
   build:
     needs: [check-limit, check_runner_availability]
+    # Re-add limit_reached to the if condition here!
     if: |
-      ${{ needs.check-limit.outputs.authorized == 'true' && needs.check_runner_availability.outputs.runner_available == 'true' }}
+      ${{ needs.check-limit.outputs.authorized == 'true' && needs.check-limit.outputs.limit_reached == 'false' && needs.check_runner_availability.outputs.runner_available == 'true' }}
     runs-on: self-hosted
+    timeout-minutes: 360 # Added timeout
     continue-on-error: true
     outputs:
       self_hosted_build_succeeded: ${{ job.status == 'success' }} 
@@ -181,6 +201,33 @@ jobs:
       THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
 
     steps:
+      # --- DEBUGGING STEP ---
+      - name: Debugging Build Job Conditions
+        run: |
+          echo "Debugging 'build' job's 'if' condition inputs:"
+          echo "needs.check-limit.outputs.authorized: '${{ needs.check-limit.outputs.authorized }}'"
+          echo "needs.check-limit.outputs.limit_reached: '${{ needs.check-limit.outputs.limit_reached }}'" # Will now be present
+          echo "needs.check_runner_availability.outputs.runner_available: '${{ needs.check_runner_availability.outputs.runner_available }}'"
+          
+          # This should evaluate to true or false based on the above
+          EVALUATED_CONDITION="${{ needs.check-limit.outputs.authorized == 'true' && needs.check-limit.outputs.limit_reached == 'false' && needs.check_runner_availability.outputs.runner_available == 'true' }}"
+          echo "Overall 'if' condition evaluates to: '${EVALUATED_CONDITION}'"
+          
+          if [[ "${{ needs.check-limit.outputs.authorized }}" != "true" ]]; then
+            echo "Reason build should be skipped: User not authorized."
+          fi
+          if [[ "${{ needs.check-limit.outputs.limit_reached }}" == "true" ]]; then
+            echo "Reason build should be skipped: Daily limit reached."
+          fi
+          if [[ "${{ needs.check_runner_availability.outputs.runner_available }}" != "true" ]]; then
+            echo "Reason build should be skipped: No runner available."
+          fi
+          
+          # If this job is running despite a "false" evaluation above,
+          # it implies a deeper issue with GitHub Actions' expression parser,
+          # which is highly unlikely. More likely, one of these values is not what we expect.
+      # --- END DEBUGGING STEP ---
+
       - name: Set Start Time
         id: start_time
         run: echo "BUILD_START_TIME=$(date +%s)" >> "$GITHUB_ENV"
