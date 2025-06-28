@@ -122,6 +122,11 @@ jobs:
     needs: check-limit
     if: ${{ needs.check-limit.outputs.authorized == 'true' }}
     runs-on: self-hosted
+    timeout-minutes: 1
+    continue-on-error: true
+    outputs:
+      self_hosted_build_succeeded: ${{ job.status == 'success' }}
+
     env:
       BRAND: ${{ inputs.BRAND }}
       CODENAME: ${{ inputs.CODENAME }}
@@ -242,3 +247,32 @@ jobs:
 
           bash telegram_notify.sh "$MESSAGE4" "$BOT_TOKEN" "$CHAT_ID" "$THREAD_ID"
 
+  fallback_crave_build:
+    needs: [check-limit, build]
+    if: |
+      (always() && needs.build.result != 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram Notification for Fallback Trigger
+        run: |
+          WORKFLOW_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MESSAGE_DISPATCH="⚠️ Attempting fallback build for ${{ inputs.CODENAME }} on Crave AOSP Builder.
+          Reason: self-hosted runner not available or busy on another build.
+          Original Workflow: [link](${WORKFLOW_RUN_URL})"
+          bash telegram_notify.sh "$MESSAGE_DISPATCH" "$BOT_TOKEN" "$CHAT_ID" "$THREAD_ID"
+
+      - name: Dispatch workflow to Crave AOSP Builder
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.PAT_TOKEN }} # Github token as repository secret with access to the crave builder repo
+          repository: BashidAkhtan/RisingOS-Revived_Crave-Builder
+          event: start-RisingOS-Revived-build
+          client-payload: |
+            {
+              "codename": "${{ inputs.CODENAME }}",
+              "brand": "${{ inputs.BRAND }}",
+              "variant": "${{ inputs.VARIANT }}",
+              "type": "${{ inputs.TYPE }}",
+              "trigger_repo": "${{ github.repository }}",
+              "trigger_run_id": "${{ github.run_id }}"
+            }
