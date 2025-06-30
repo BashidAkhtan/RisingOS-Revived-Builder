@@ -179,6 +179,9 @@ jobs:
             echo "API Response does not contain a valid 'runners' array or is not valid JSON. This could indicate insufficient token permissions or an incorrect API URL."
             echo "runner_found=false" >> $GITHUB_OUTPUT
           fi
+        - name: Debug: Print runner_found output
+  run: |
+    echo "DEBUG - runner_found output: '${{ steps.check_api.outputs.runner_found }}'
 
   build:
     needs: [check-limit, check_runner_availability]
