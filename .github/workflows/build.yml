@@ -107,7 +107,7 @@ jobs:
           
           # Only increment if limit is NOT reached
           NEW_RUNS=$((TODAY_RUNS + 1))
-          jq --arg device "$DEVICE" --arg date "$CURRENT_DATE" --argjson runs "$NEW_RUN00S" \
+          jq --arg device "$DEVICE" --arg date "$CURRENT_DATE" --argjson runs "$NEW_RUNS" \
             'del(.[$device]) | .[$device][$date] = $runs' "$COUNTER_FILE" > tmp.json && mv tmp.json "$COUNTER_FILE"
 
           echo "Updated run count for device $DEVICE: $NEW_RUNS"
