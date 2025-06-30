@@ -41,7 +41,6 @@ jobs:
     outputs:
       authorized: ${{ steps.check_user.outputs.authorized }}
       core: ${{ steps.check_user.outputs.core }}
-      # IMPORTANT: Add limit_reached back to outputs!
       limit_reached: ${{ steps.set_limit_reached_output.outputs.limit_reached_status }} 
     steps:
       - name: Checkout repository
@@ -54,12 +53,8 @@ jobs:
             echo "authorized_users.json not found"
             exit 1
           fi
-
-          # Check for authorization (plain username or CORE:username)
           if jq -e "index(\"${{ github.actor }}\")" authorized_users.json > /dev/null || jq -e "index(\"CORE:${{ github.actor }}\")" authorized_users.json > /dev/null; then
             echo "authorized=true" >> $GITHUB_OUTPUT
-
-            # Check for core status (CORE:username)
             if jq -e "index(\"CORE:${{ github.actor }}\")" authorized_users.json > /dev/null; then
               echo "core=true" >> $GITHUB_OUTPUT
             else
@@ -67,15 +62,13 @@ jobs:
             fi
           else
             echo "authorized=false" >> $GITHUB_OUTPUT
-            echo "User ${{ github.actor }} is not authorized to trigger this build."
             exit 1
           fi
 
       - name: Check Builds Limit
-        id: check_limit_step # Renamed to avoid confusion and use as a step ID
-        if: ${{ steps.check_user.outputs.authorized == 'true' }} # Only run if user is authorized
+        id: check_limit_step
+        if: ${{ steps.check_user.outputs.authorized == 'true' }}
         run: |
-          echo "Debugging: core output is: '${{ steps.check_user.outputs.core }}'"
           COUNTER_FILE=".github/workflow_counter.json"
           CURRENT_DATE=$(date +%Y-%m-%d)
           DEVICE=${{ inputs.CODENAME }}
@@ -91,53 +84,41 @@ jobs:
             TODAY_RUNS=0
           fi
 
-          echo "Today's runs for device $DEVICE: $TODAY_RUNS"
-
           if [[ "${{ steps.check_user.outputs.core }}" == "true" ]]; then
-            LIMIT=-1  # Core users have no limit
+            LIMIT=-1
           else
-            LIMIT=3  # Non-core users have a limit of 3 runs
+            LIMIT=3
           fi
 
           if [[ $LIMIT -ne -1 && "$TODAY_RUNS" -ge $LIMIT ]]; then
-            echo "Device $DEVICE has reached the daily limit of $LIMIT workflow runs."
-            echo "::error::Daily build limit reached for device ${{ inputs.CODENAME }}."
-            exit 1 # Fail this step if limit is reached
+            echo "::error::Daily build limit reached for device $DEVICE."
+            exit 1
           fi
-          
-          # Only increment if limit is NOT reached
+
           NEW_RUNS=$((TODAY_RUNS + 1))
           jq --arg device "$DEVICE" --arg date "$CURRENT_DATE" --argjson runs "$NEW_RUNS" \
             'del(.[$device]) | .[$device][$date] = $runs' "$COUNTER_FILE" > tmp.json && mv tmp.json "$COUNTER_FILE"
 
-          echo "Updated run count for device $DEVICE: $NEW_RUNS"
-
-      # NEW STEP: Set Job Limit Reached Output explicitly based on check_limit_step outcome
       - name: Set Job Limit Reached Output
         id: set_limit_reached_output
         run: |
-          LIMIT_STATUS="false" 
-          # If check_limit_step failed (due to exit 1 for limit reached), set status to true
+          LIMIT_STATUS="false"
           if [[ "${{ steps.check_limit_step.outcome }}" == "failure" ]]; then
             LIMIT_STATUS="true"
           fi
           echo "limit_reached_status=${LIMIT_STATUS}" >> $GITHUB_OUTPUT
 
       - name: Commit and push counter update
-        # Only commit if the limit check was successful (i.e., not a failure)
         if: ${{ steps.check_limit_step.outcome == 'success' }}
         run: |
-          COUNTER_FILE=".github/workflow_counter.json"
           git config --global user.email "actions@github.com"
           git config --global user.name "GitHub Actions"
-          git add $COUNTER_FILE
+          git add .github/workflow_counter.json
           git commit -m "Update workflow run count for device ${{ inputs.CODENAME }}"
           git push
 
-  # Check Self-Hosted Runner Availability via API
   check_runner_availability:
     needs: check-limit
-    # Only check runner availability if user is authorized AND limit is NOT reached
     if: ${{ needs.check-limit.outputs.authorized == 'true' && needs.check-limit.outputs.limit_reached == 'false' }}
     runs-on: ubuntu-latest
     outputs:
@@ -150,50 +131,24 @@ jobs:
         run: |
           REPO_OWNER="${{ github.repository_owner }}"
           REPO_NAME="${{ github.event.repository.name }}"
-          
           RUNNERS_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/actions/runners"
-          
-          echo "Attempting to query runners from URL: $RUNNERS_URL"
-
-          API_RESPONSE=$(curl -s -D /dev/stderr -H "Accept: application/vnd.github+json" \
-                                -H "Authorization: token $GITHUB_TOKEN" \
-                                "$RUNNERS_URL")
-          
-          echo "Raw API Response:"
-          echo "$API_RESPONSE"
-          
-          if echo "$API_RESPONSE" | jq -e '.runners | length' > /dev/null; then
-            echo "API Response contains a 'runners' array."
-            
-            AVAILABLE_RUNNERS=$(echo "$API_RESPONSE" | jq '.runners[] | select(.status=="online" and (.labels | map(.name) | contains(["self-hosted", "aosp-builder"])))')
-
-            if [[ -z "$AVAILABLE_RUNNERS" ]]; then
-              echo "No online self-hosted runners with labels 'self-hosted, aosp-builder' found in this repository."
-              echo "runner_found=false" >> $GITHUB_OUTPUT
-            else
-              echo "Found at least one online self-hosted runner with labels 'self-hosted, aosp-builder' in this repository."
-              echo "runner_found=true" >> $GITHUB_OUTPUT
-              echo "Available Runners (filtered): $AVAILABLE_RUNNERS"
-            fi
-          else
-            echo "API Response does not contain a valid 'runners' array or is not valid JSON. This could indicate insufficient token permissions or an incorrect API URL."
+          API_RESPONSE=$(curl -s -H "Accept: application/vnd.github+json" -H "Authorization: token $GITHUB_TOKEN" "$RUNNERS_URL")
+          AVAILABLE_RUNNERS=$(echo "$API_RESPONSE" | jq '.runners[] | select(.status=="online" and (.labels | map(.name) | contains(["self-hosted", "aosp-builder"])))')
+          if [[ -z "$AVAILABLE_RUNNERS" ]]; then
             echo "runner_found=false" >> $GITHUB_OUTPUT
+          else
+            echo "runner_found=true" >> $GITHUB_OUTPUT
           fi
-        - name: Debug: Print runner_found output
-  run: |
-    echo "DEBUG - runner_found output: '${{ steps.check_api.outputs.runner_found }}'
+
+      - name: Debug: Print runner_found output
+        run: |
+          echo "DEBUG - runner_found: '${{ steps.check_api.outputs.runner_found }}'"
 
   build:
     needs: [check-limit, check_runner_availability]
-    # Re-add limit_reached to the if condition here!
-    if: |
-      ${{ needs.check-limit.outputs.authorized == 'true' && needs.check-limit.outputs.limit_reached == 'false' && needs.check_runner_availability.outputs.runner_available == 'true' }}
+    if: ${{ needs.check-limit.outputs.authorized == 'true' && needs.check-limit.outputs.limit_reached == 'false' && needs.check_runner_availability.outputs.runner_available == 'true' }}
     runs-on: self-hosted
-    timeout-minutes: 360 # Added timeout
-    continue-on-error: true
-    outputs:
-      self_hosted_build_succeeded: ${{ job.status == 'success' }} 
-
+    timeout-minutes: 360
     env:
       BRAND: ${{ inputs.BRAND }}
       CODENAME: ${{ inputs.CODENAME }}
@@ -202,167 +157,35 @@ jobs:
       BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
-
     steps:
-      # --- DEBUGGING STEP ---
-      - name: Debugging Build Job Conditions
+      - name: Debug Conditions
         run: |
-          echo "Debugging 'build' job's 'if' condition inputs:"
-          echo "needs.check-limit.outputs.authorized: '${{ needs.check-limit.outputs.authorized }}'"
-          echo "needs.check-limit.outputs.limit_reached: '${{ needs.check-limit.outputs.limit_reached }}'" # Will now be present
-          echo "needs.check_runner_availability.outputs.runner_available: '${{ needs.check_runner_availability.outputs.runner_available }}'"
-          
-          # This should evaluate to true or false based on the above
-          EVALUATED_CONDITION="${{ needs.check-limit.outputs.authorized == 'true' && needs.check-limit.outputs.limit_reached == 'false' && needs.check_runner_availability.outputs.runner_available == 'true' }}"
-          echo "Overall 'if' condition evaluates to: '${EVALUATED_CONDITION}'"
-          
-          if [[ "${{ needs.check-limit.outputs.authorized }}" != "true" ]]; then
-            echo "Reason build should be skipped: User not authorized."
-          fi
-          if [[ "${{ needs.check-limit.outputs.limit_reached }}" == "true" ]]; then
-            echo "Reason build should be skipped: Daily limit reached."
-          fi
-          if [[ "${{ needs.check_runner_availability.outputs.runner_available }}" != "true" ]]; then
-            echo "Reason build should be skipped: No runner available."
-          fi
-          
-          # If this job is running despite a "false" evaluation above,
-          # it implies a deeper issue with GitHub Actions' expression parser,
-          # which is highly unlikely. More likely, one of these values is not what we expect.
-      # --- END DEBUGGING STEP ---
-
-      - name: Set Start Time
-        id: start_time
-        run: echo "BUILD_START_TIME=$(date +%s)" >> "$GITHUB_ENV"
-
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Get Job ID
-        uses: austenstone/job-id@v1
-        id: get_job_id
-
-      - name: Init and Sync
-        run: bash resync.sh
-
-      - name: Clone Repositories
-        run: bash clone.sh
-
-      - name: Set flags
-        run: bash misc/flags.sh
-
-      - name: Build RisingOS
-        run: bash build.sh
-
-      - name: Upload Build Files to Gofile
-        id: upload_files
-        if: ${{ success() }}
-        run: bash upload.sh
-
-      - name: Capture Gofile Links
-        if: ${{ steps.upload_files.outcome == 'success' }}
-        run: |
-          echo "ROM_GOFILE_LINKS=$(cat $GITHUB_ENV | grep -oE "ROM_GOFILE_LINKS=[^ ]*")" >> $GITHUB_OUTPUT
-          echo "BOOT_IMG_LINK=$(cat $GITHUB_ENV | grep -oE "BOOT_IMG_LINK=[^ ]*")" >> $GITHUB_OUTPUT
-          echo "DTBO_IMG_LINK=$(cat $GITHUB_ENV | grep -oE "DTBO_IMG_LINK=[^ ]*")" >> $GITHUB_OUTPUT
-          echo "VENDOR_BOOT_IMG_LINK=$(cat $GITHUB_ENV | grep -oE "VENDOR_BOOT_IMG_LINK=[^ ]*")" >> $GITHUB_OUTPUT
-          echo "RECOVERY_IMG_LINK=$(cat $GITHUB_ENV | grep -oE "RECOVERY_IMG_LINK=[^ ]*")" >> $GITHUB_OUTPUT
-        id: gofile_links
-
-      - name: Upload Error Log to Gofile
-        id: upload_error-log
-        if: ${{ failure() }}
-        run: bash error-log_upload.sh
-
-      - name: Capture error.log Gofile Link
-        if: ${{ steps.upload_error-log.outcome == 'success' }}
-        run: |
-          echo "ERROR_LOG_LINK=$(cat $GITHUB_ENV | grep -oE "ERROR_LOG_LINK=[^ ]*")" >> $GITHUB_OUTPUT
-        id: gofile_error-log_link
-
-      - name: Post-Cleanup
-        if: ${{ always() }}
-        run: bash clean.sh
-
-      - name: Set End Time
-        id: end_time
-        if: always()
-        run: echo "BUILD_END_TIME=$(date +%s)" >> "$GITHUB_ENV"
-
-      - name: Calculate Duration
-        id: calculate_duration
-        if: always()
-        run: |
-          start_time="${{ env.BUILD_START_TIME }}"
-          end_time="${{ env.BUILD_END_TIME }}"
-          duration_seconds=$((end_time - start_time))
-          duration=$(echo "$duration_seconds" | awk '{
-            h = int($1 / 3600);
-            m = int(($1 % 3600) / 60);
-            s = $1 % 60;
-            printf "%02d:%02d:%02d", h, m, s;
-          }')
-          echo "BUILD_DURATION=$duration" >> "$GITHUB_ENV"
-
-      - name: Notify Build Success (Telegram)
-        if: ${{ success() }}
-        run: |
-          RUN_ID="${{ github.run_id }}"
-          JOB_ID="${{ steps.get_job_id.outputs.job-id }}"
-          STEP_NUMBER="10"
-
-          LOG_LINK="https://github.com/${{ github.repository }}/actions/runs/${RUN_ID}/job/${JOB_ID}#step:${STEP_NUMBER}:16"
-          MESSAGE2="✅ Build for ${{ inputs.CODENAME }} succeeded!
-          🔗 Download Links: [link](${LOG_LINK})
-          ⏱️ Build Time: ${{ env.BUILD_DURATION }}"
-         
-          bash telegram_notify.sh "$MESSAGE2" "$BOT_TOKEN" "$CHAT_ID" "$THREAD_ID"
-
-      - name: Notify Build Failure (Telegram)
-        if: ${{ failure() }}
-        run: |
-          RUN_ID="${{ github.run_id }}"
-          JOB_ID="${{ steps.get_job_id.outputs.job-id }}"
-          ERROR_STEP_NUMBER="17"
-
-          ERROR_LOG_LINK="https://github.com/${{ github.repository }}/actions/runs/${RUN_ID}/job/${JOB_ID}#step:${ERROR_STEP_NUMBER}:22"
-          MESSAGE3="❌ Build for ${{ inputs.CODENAME }} failed.
-          🔗 Download error.log: [link](${ERROR_LOG_LINK})
-          ⏱️ Build Time: ${{ env.BUILD_DURATION }}"
-
-          bash telegram_notify.sh "$MESSAGE3" "$BOT_TOKEN" "$CHAT_ID" "$THREAD_ID"
-
-      - name: Notify Build Cancelled
-        if: ${{ cancelled() }}
-        run: |
-          MESSAGE4="🚫 Build for ${{ inputs.CODENAME }} is cancelled!
-          Workflow: [link](${WORKFLOW_RUN_URL})
-          ⏱️ Build Time: ${{ env.BUILD_DURATION }}"
-
-          bash telegram_notify.sh "$MESSAGE4" "$BOT_TOKEN" "$CHAT_ID" "$THREAD_ID"
+          echo "Authorized: ${{ needs.check-limit.outputs.authorized }}"
+          echo "Limit Reached: ${{ needs.check-limit.outputs.limit_reached }}"
+          echo "Runner Available: ${{ needs.check_runner_availability.outputs.runner_available }}"
+      # Add real build steps here...
 
   fallback_crave_build:
-    needs: [check-limit, check_runner_availability, build] # Now depends on new runner check job
+    needs: [check-limit, check_runner_availability, build]
     if: |
-      ${{ needs.check-limit.result != 'success' }} ||
-      ${{ needs.check_runner_availability.outputs.runner_available == 'false' }} ||
-      (always() && needs.build.result != 'success')
+      needs.check-limit.result != 'success' ||
+      needs.check_runner_availability.result != 'success' ||
+      needs.check_runner_availability.outputs.runner_available != 'true' ||
+      needs.build.result != 'success'
     runs-on: ubuntu-latest
     steps:
-      - name: Send Telegram Notification for Fallback Trigger
+      - name: Debug: Print fallback inputs
         run: |
-          WORKFLOW_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          MESSAGE_DISPATCH="⚠️ Attempting fallback build for ${{ inputs.CODENAME }} on Crave AOSP Builder.
-          Reason: self-hosted runner not available or busy on another build.
-          Original Workflow: [link](${WORKFLOW_RUN_URL})"
-          bash telegram_notify.sh "$MESSAGE_DISPATCH" "$BOT_TOKEN" "$CHAT_ID" "$THREAD_ID"
-
-      - name: Dispatch workflow to Crave AOSP Builder
+          echo "check-limit.result: '${{ needs.check-limit.result }}'"
+          echo "check_runner_availability.result: '${{ needs.check_runner_availability.result }}'"
+          echo "runner_available: '${{ needs.check_runner_availability.outputs.runner_available }}'"
+          echo "build.result: '${{ needs.build.result }}'"
+      - name: Dispatch to Crave
         uses: peter-evans/repository-dispatch@v3
         with:
-          token: ${{ secrets.PAT_TOKEN }} # Github token as repository secret with access to the crave builder repo
+          token: ${{ secrets.PAT_TOKEN }}
           repository: BashidAkhtan/RisingOS-Revived_Crave-Builder
-          event: start-RisingOS-Revived-build
+          event-type: start-RisingOS-Revived-build
           client-payload: |
             {
               "codename": "${{ inputs.CODENAME }}",
