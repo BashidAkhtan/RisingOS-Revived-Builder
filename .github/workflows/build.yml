@@ -186,7 +186,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Debug: List files in repo root
+      - name: List files in repo root
         run: ls -la
 
       - name: Ensure telegram_notify.sh is executable
