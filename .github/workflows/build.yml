@@ -131,7 +131,7 @@ jobs:
             echo "runner_found=true" >> $GITHUB_OUTPUT
           fi
 
-      - name: Debug: Print runner_found output
+      - name: Print runner_found output
         run: |
           echo "DEBUG - runner_found: '$RUNNER_FOUND'"
         env:
