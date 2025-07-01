@@ -210,7 +210,7 @@ jobs:
           echo "build_status=$build_status" >> $GITHUB_OUTPUT
 
       - name: Debug print build_status output
-        run: echo "DEBUG: build_status output is '${{ steps.get_build_status.outputs.build_status }}'"
+        run: echo " build_status output is '${{ steps.get_build_status.outputs.build_status }}'"
 
       - name: Send Telegram Notification for Fallback Trigger
         if: ${{ steps.get_build_status.outputs.build_status != 'success' }}
