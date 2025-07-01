@@ -41,6 +41,7 @@ jobs:
     outputs:
       authorized: ${{ steps.check_user.outputs.authorized }}
       core: ${{ steps.check_user.outputs.core }}
+      limit_reached: ${{ steps.set_limit_reached_output.outputs.limit_reached_status }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -70,58 +71,81 @@ jobs:
           fi
 
       - name: Check Builds Limit
-        id: check_limit
+        id: check_limit_step
         if: ${{ steps.check_user.outputs.authorized == 'true' }}
         run: |
-          echo "Debugging: core output is: '${{ steps.check_user.outputs.core }}'"
           COUNTER_FILE=".github/workflow_counter.json"
           CURRENT_DATE=$(date +%Y-%m-%d)
           DEVICE=${{ inputs.CODENAME }}
-
           if [[ ! -f "$COUNTER_FILE" ]] || ! jq empty "$COUNTER_FILE" 2>/dev/null; then
             echo '{}' > "$COUNTER_FILE"
           fi
-
-          TODAY_RUNS=$(jq -r --arg device "$DEVICE" --arg date "$CURRENT_DATE" \
-            'if .[$device][$date] then .[$device][$date] else 0 end' "$COUNTER_FILE")
-
-          if [[ ! "$TODAY_RUNS" =~ ^[0-9]+$ ]]; then
-            TODAY_RUNS=0
-          fi
-
-          echo "Today's runs for device $DEVICE: $TODAY_RUNS"
-
+          TODAY_RUNS=$(jq -r --arg device "$DEVICE" --arg date "$CURRENT_DATE" 'if .[$device][$date] then .[$device][$date] else 0 end' "$COUNTER_FILE")
+          if [[ ! "$TODAY_RUNS" =~ ^[0-9]+$ ]]; then TODAY_RUNS=0; fi
           if [[ "${{ steps.check_user.outputs.core }}" == "true" ]]; then
             LIMIT=-1  # Core users have no limit
           else
             LIMIT=3  # Non-core users have a limit of 3 runs
           fi
-
           if [[ $LIMIT -ne -1 && "$TODAY_RUNS" -ge $LIMIT ]]; then
             echo "Device $DEVICE has reached the daily limit of $LIMIT workflow runs."
             exit 1
           fi
-
           NEW_RUNS=$((TODAY_RUNS + 1))
-          jq --arg device "$DEVICE" --arg date "$CURRENT_DATE" --argjson runs "$NEW_RUNS" \
-            'del(.[$device]) | .[$device][$date] = $runs' "$COUNTER_FILE" > tmp.json && mv tmp.json "$COUNTER_FILE"
+          jq --arg device "$DEVICE" --arg date "$CURRENT_DATE" --argjson runs "$NEW_RUNS" 'del(.[$device]) | .[$device][$date] = $runs' "$COUNTER_FILE" > tmp.json && mv tmp.json "$COUNTER_FILE"
 
-          echo "Updated run count for device $DEVICE: $NEW_RUNS"
+      - name: Set Job Limit Reached Output
+        id: set_limit_reached_output
+        run: |
+          if [[ "${{ steps.check_limit_step.outcome }}" == "failure" ]]; then
+            echo "limit_reached_status=true" >> $GITHUB_OUTPUT
+          else
+            echo "limit_reached_status=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Commit and push counter update
-        if: ${{ steps.check_limit.outcome == 'success' }}
+        if: ${{ steps.check_limit_step.outcome == 'success' }}
         run: |
-          COUNTER_FILE=".github/workflow_counter.json"
           git config --global user.email "actions@github.com"
           git config --global user.name "GitHub Actions"
-          git add $COUNTER_FILE
-          git commit -m "Update workflow run count for device ${{ inputs.CODENAME }}"
+          git add .github/workflow_counter.json
+          git commit -m "Update workflow run count for ${{ inputs.CODENAME }}"
           git push
 
-  build:
+  check_runner_availability:
     needs: check-limit
-    if: ${{ needs.check-limit.outputs.authorized == 'true' }}
+    if: ${{ needs.check-limit.outputs.authorized == 'true' && needs.check-limit.outputs.limit_reached == 'false' }}
+    runs-on: ubuntu-latest
+    outputs:
+      runner_available: ${{ steps.check_api.outputs.runner_found }}
+    steps:
+      - name: Check Self-Hosted Runner Status via API
+        id: check_api
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          RUNNERS_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/actions/runners"
+          API_RESPONSE=$(curl -s -H "Accept: application/vnd.github+json" -H "Authorization: token $GITHUB_TOKEN" "$RUNNERS_URL")
+          AVAILABLE_RUNNERS=$(echo "$API_RESPONSE" | jq '.runners[] | select(.status=="online" and (.labels | map(.name) | contains(["self-hosted", "aosp-builder"])))')
+          if [[ -z "$AVAILABLE_RUNNERS" ]]; then
+            echo "runner_found=false" >> $GITHUB_OUTPUT
+          else
+            echo "runner_found=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Print runner_found output
+        run: |
+          echo "DEBUG - runner_found: '$RUNNER_FOUND'"
+        env:
+          RUNNER_FOUND: ${{ steps.check_api.outputs.runner_found }}
+
+  build:
+    needs: [check-limit, check_runner_availability]
+    if: ${{ needs.check-limit.outputs.authorized == 'true' && needs.check-limit.outputs.limit_reached == 'false' && needs.check_runner_availability.outputs.runner_available == 'true' }}
     runs-on: self-hosted
+    continue-on-error: true
     env:
       BRAND: ${{ inputs.BRAND }}
       CODENAME: ${{ inputs.CODENAME }}
@@ -130,7 +154,6 @@ jobs:
       BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
-
     steps:
       - name: Set Start Time
         id: start_time
@@ -236,9 +259,77 @@ jobs:
       - name: Notify Build Cancelled
         if: ${{ cancelled() }}
         run: |
+          WORKFLOW_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           MESSAGE4="🚫 Build for ${{ inputs.CODENAME }} is cancelled!
           Workflow: [link](${WORKFLOW_RUN_URL})
           ⏱️ Build Time: ${{ env.BUILD_DURATION }}"
 
           bash telegram_notify.sh "$MESSAGE4" "$BOT_TOKEN" "$CHAT_ID" "$THREAD_ID"
 
+  fallback_crave_build:
+      needs: [check-limit, check_runner_availability]
+      if: |
+        needs.check-limit.outputs.limit_reached == 'false' ||
+        needs.check_runner_availability.outputs.runner_available == 'false' ||
+        always()
+      runs-on: ubuntu-latest
+      steps:
+        - name: Checkout repository
+          uses: actions/checkout@v4
+  
+        - name: Debug info - print inputs and needs outputs
+          run: |
+            echo "Inputs:"
+            echo "  CODENAME = ${{ inputs.CODENAME }}"
+            echo "Needs outputs:"
+            echo "  limit_reached = ${{ needs.check-limit.outputs.limit_reached }}"
+            echo "  runner_available = ${{ needs.check_runner_availability.outputs.runner_available }}"
+            echo "GitHub actor: ${{ github.actor }}"
+            echo "Workflow run ID: ${{ github.run_id }}"
+
+        - name: Get build job status
+          id: get_build_status
+          env:
+            GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+            RUN_ID: ${{ github.run_id }}
+            REPO: ${{ github.repository }}
+          run: |
+            API_URL="https://api.github.com/repos/${REPO}/actions/runs/${RUN_ID}/jobs"
+            echo "DEBUG: Querying jobs API URL: $API_URL"
+            response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "$API_URL")
+            echo "DEBUG: Raw API response:"
+            echo "$response"
+            build_status=$(echo "$response" | jq -r '.jobs[] | select(.name=="build") | .conclusion')
+            echo "DEBUG: build job conclusion = $build_status"
+            echo "build_status=$build_status" >> $GITHUB_OUTPUT
+
+        - name: Debug print build_status output
+          run: echo " build_status output is '${{ steps.get_build_status.outputs.build_status }}'"
+
+        - name: Send Telegram Notification for Fallback Trigger
+          if: ${{ steps.get_build_status.outputs.build_status != 'success' }}
+          run: |
+            WORKFLOW_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            CRAVE_WORKFLOW_RUN_URL="https://github.com/RisingOS-Revived-devices/RisingOS-Revived_Crave-Builder/actions"
+            MESSAGE5="⚠️ *Fallback Triggered for ${{ inputs.CODENAME }}*
+            Self-hosted runner is currently *unavailable*. Build has been *redirected to Crave pipeline*.
+            🔁 *Crave Workflow:* [View Crave Workflow](${CRAVE_WORKFLOW_RUN_URL})  
+            📄 *Original Workflow:* [View on GitHub](${WORKFLOW_RUN_URL})"
+            bash telegram_notify.sh "$MESSAGE5" "${{ secrets.TELEGRAM_BOT_TOKEN }}" "${{ secrets.TELEGRAM_CHAT_ID }}" "${{ secrets.TELEGRAM_THREAD_ID }}"
+
+        - name: Dispatch workflow to Crave AOSP Builder
+          if: ${{ steps.get_build_status.outputs.build_status != 'success' }}
+          uses: peter-evans/repository-dispatch@v3
+          with:
+            token: ${{ secrets.PAT_TOKEN }}
+            repository: ${{ github.repository_owner }}/RisingOS-Revived_Crave-Builder
+            event-type: start-RisingOS-Revived-build
+            client-payload: |
+              {
+                "codename": "${{ inputs.CODENAME }}",
+                "brand": "${{ inputs.BRAND }}",
+                "variant": "${{ inputs.VARIANT }}",
+                "type": "${{ inputs.TYPE }}",
+                "trigger_repo": "${{ github.repository }}",
+                "trigger_run_id": "${{ github.run_id }}"
+              }
