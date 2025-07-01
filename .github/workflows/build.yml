@@ -183,6 +183,15 @@ jobs:
       always()
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Debug: List files in repo root
+        run: ls -la
+
+      - name: Ensure telegram_notify.sh is executable
+        run: chmod +x telegram_notify.sh
+
       - name: Debug info - print inputs and needs outputs
         run: |
           echo "Inputs:"
