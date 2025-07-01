@@ -176,17 +176,51 @@ jobs:
         run: bash clean.sh
 
   fallback_crave_build:
-    needs: [check-limit, build]
-    if: ${{ needs.check-limit.outputs.authorized == 'true' && needs.build.result == 'skipped' }}
+    needs: [check-limit, check_runner_availability]
+    if: |
+      needs.check-limit.outputs.limit_reached == 'false' ||
+      needs.check_runner_availability.outputs.runner_available == 'false' ||
+      always()
     runs-on: ubuntu-latest
     steps:
+      - name: Debug info - print inputs and needs outputs
+        run: |
+          echo "Inputs:"
+          echo "  CODENAME = ${{ inputs.CODENAME }}"
+          echo "Needs outputs:"
+          echo "  limit_reached = ${{ needs.check-limit.outputs.limit_reached }}"
+          echo "  runner_available = ${{ needs.check_runner_availability.outputs.runner_available }}"
+          echo "GitHub actor: ${{ github.actor }}"
+          echo "Workflow run ID: ${{ github.run_id }}"
+
+      - name: Get build job status
+        id: get_build_status
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          API_URL="https://api.github.com/repos/${REPO}/actions/runs/${RUN_ID}/jobs"
+          echo "DEBUG: Querying jobs API URL: $API_URL"
+          response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "$API_URL")
+          echo "DEBUG: Raw API response:"
+          echo "$response"
+          build_status=$(echo "$response" | jq -r '.jobs[] | select(.name=="build") | .conclusion')
+          echo "DEBUG: build job conclusion = $build_status"
+          echo "build_status=$build_status" >> $GITHUB_OUTPUT
+
+      - name: Debug print build_status output
+        run: echo "DEBUG: build_status output is '${{ steps.get_build_status.outputs.build_status }}'"
+
       - name: Send Telegram Notification for Fallback Trigger
+        if: ${{ steps.get_build_status.outputs.build_status != 'success' }}
         run: |
           WORKFLOW_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          MESSAGE_DISPATCH="⚠️ Attempting fallback build for ${{ inputs.CODENAME }} on Crave AOSP Builder.\nReason: build was skipped.\nOriginal Workflow: [link](${WORKFLOW_RUN_URL})"
+          MESSAGE_DISPATCH="⚠️ Attempting fallback build for ${{ inputs.CODENAME }} on Crave AOSP Builder.\nReason: build job failed/skipped.\nOriginal Workflow: [link](${WORKFLOW_RUN_URL})"
           bash telegram_notify.sh "$MESSAGE_DISPATCH" "${{ secrets.TELEGRAM_BOT_TOKEN }}" "${{ secrets.TELEGRAM_CHAT_ID }}" "${{ secrets.TELEGRAM_THREAD_ID }}"
 
       - name: Dispatch workflow to Crave AOSP Builder
+        if: ${{ steps.get_build_status.outputs.build_status != 'success' }}
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.PAT_TOKEN }}
