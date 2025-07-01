@@ -234,7 +234,7 @@ jobs:
         with:
           token: ${{ secrets.PAT_TOKEN }}
           repository: BashidAkhtan/RisingOS-Revived_Crave-Builder
-          event: start-RisingOS-Revived-build
+          event-type: start-RisingOS-Revived-build
           client-payload: |
             {
               "codename": "${{ inputs.CODENAME }}",
