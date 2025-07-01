@@ -178,7 +178,7 @@ jobs:
   fallback_crave_build:
     needs: [check-limit, check_runner_availability, build]
     if: |
-      ${{ needs.check-limit.result != 'success' }} ||
+      ${{ needs.check-limit.outputs.limit_reached == 'false' }} ||
       ${{ needs.check_runner_availability.outputs.runner_available == 'false' }} ||
       (always() && needs.build.result != 'success')
     runs-on: ubuntu-latest
