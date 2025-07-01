@@ -176,17 +176,14 @@ jobs:
         run: bash clean.sh
 
   fallback_crave_build:
-    needs: [check-limit, check_runner_availability, build]
-    if: |
-      ${{ needs.check-limit.outputs.limit_reached == 'false' }} ||
-      ${{ needs.check_runner_availability.outputs.runner_available == 'false' }} ||
-      (always() && needs.build.result != 'success')
+    needs: [check-limit, build]
+    if: ${{ needs.check-limit.outputs.authorized == 'true' && needs.build.result == 'skipped' }}
     runs-on: ubuntu-latest
     steps:
       - name: Send Telegram Notification for Fallback Trigger
         run: |
           WORKFLOW_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          MESSAGE_DISPATCH="⚠️ Attempting fallback build for ${{ inputs.CODENAME }} on Crave AOSP Builder.\nReason: self-hosted runner not available or failed.\nOriginal Workflow: [link](${WORKFLOW_RUN_URL})"
+          MESSAGE_DISPATCH="⚠️ Attempting fallback build for ${{ inputs.CODENAME }} on Crave AOSP Builder.\nReason: build was skipped.\nOriginal Workflow: [link](${WORKFLOW_RUN_URL})"
           bash telegram_notify.sh "$MESSAGE_DISPATCH" "${{ secrets.TELEGRAM_BOT_TOKEN }}" "${{ secrets.TELEGRAM_CHAT_ID }}" "${{ secrets.TELEGRAM_THREAD_ID }}"
 
       - name: Dispatch workflow to Crave AOSP Builder
