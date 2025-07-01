@@ -41,7 +41,7 @@ jobs:
     outputs:
       authorized: ${{ steps.check_user.outputs.authorized }}
       core: ${{ steps.check_user.outputs.core }}
-      limit_reached: ${{ steps.set_limit_reached_output.outputs.limit_reached_status }} 
+      limit_reached: ${{ steps.set_limit_reached_output.outputs.limit_reached_status }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -53,10 +53,8 @@ jobs:
             echo "authorized_users.json not found"
             exit 1
           fi
-
           if jq -e "index(\"${{ github.actor }}\")" authorized_users.json > /dev/null || jq -e "index(\"CORE:${{ github.actor }}\")" authorized_users.json > /dev/null; then
             echo "authorized=true" >> $GITHUB_OUTPUT
-
             if jq -e "index(\"CORE:${{ github.actor }}\")" authorized_users.json > /dev/null; then
               echo "core=true" >> $GITHUB_OUTPUT
             else
@@ -64,7 +62,7 @@ jobs:
             fi
           else
             echo "authorized=false" >> $GITHUB_OUTPUT
-            echo "User ${{ github.actor }} is not authorized to trigger this build."
+            echo "User ${{ github.actor }} is not authorized."
             exit 1
           fi
 
@@ -72,57 +70,42 @@ jobs:
         id: check_limit_step
         if: ${{ steps.check_user.outputs.authorized == 'true' }}
         run: |
-          echo "Debugging: core output is: '${{ steps.check_user.outputs.core }}'"
           COUNTER_FILE=".github/workflow_counter.json"
           CURRENT_DATE=$(date +%Y-%m-%d)
           DEVICE=${{ inputs.CODENAME }}
-
           if [[ ! -f "$COUNTER_FILE" ]] || ! jq empty "$COUNTER_FILE" 2>/dev/null; then
             echo '{}' > "$COUNTER_FILE"
           fi
-
           TODAY_RUNS=$(jq -r --arg device "$DEVICE" --arg date "$CURRENT_DATE" 'if .[$device][$date] then .[$device][$date] else 0 end' "$COUNTER_FILE")
-
-          if [[ ! "$TODAY_RUNS" =~ ^[0-9]+$ ]]; then
-            TODAY_RUNS=0
-          fi
-
-          echo "Today's runs for device $DEVICE: $TODAY_RUNS"
-
+          if [[ ! "$TODAY_RUNS" =~ ^[0-9]+$ ]]; then TODAY_RUNS=0; fi
           if [[ "${{ steps.check_user.outputs.core }}" == "true" ]]; then
             LIMIT=-1
           else
             LIMIT=3
           fi
-
           if [[ $LIMIT -ne -1 && "$TODAY_RUNS" -ge $LIMIT ]]; then
-            echo "Device $DEVICE has reached the daily limit of $LIMIT workflow runs."
-            echo "::error::Daily build limit reached for device ${{ inputs.CODENAME }}."
+            echo "::error::Daily build limit reached for $DEVICE."
             exit 1
           fi
-
           NEW_RUNS=$((TODAY_RUNS + 1))
           jq --arg device "$DEVICE" --arg date "$CURRENT_DATE" --argjson runs "$NEW_RUNS" 'del(.[$device]) | .[$device][$date] = $runs' "$COUNTER_FILE" > tmp.json && mv tmp.json "$COUNTER_FILE"
-
-          echo "Updated run count for device $DEVICE: $NEW_RUNS"
 
       - name: Set Job Limit Reached Output
         id: set_limit_reached_output
         run: |
-          LIMIT_STATUS="false" 
           if [[ "${{ steps.check_limit_step.outcome }}" == "failure" ]]; then
-            LIMIT_STATUS="true"
+            echo "limit_reached_status=true" >> $GITHUB_OUTPUT
+          else
+            echo "limit_reached_status=false" >> $GITHUB_OUTPUT
           fi
-          echo "limit_reached_status=${LIMIT_STATUS}" >> $GITHUB_OUTPUT
 
       - name: Commit and push counter update
         if: ${{ steps.check_limit_step.outcome == 'success' }}
         run: |
-          COUNTER_FILE=".github/workflow_counter.json"
           git config --global user.email "actions@github.com"
           git config --global user.name "GitHub Actions"
-          git add $COUNTER_FILE
-          git commit -m "Update workflow run count for device ${{ inputs.CODENAME }}"
+          git add .github/workflow_counter.json
+          git commit -m "Update workflow run count for ${{ inputs.CODENAME }}"
           git push
 
   check_runner_availability:
@@ -150,42 +133,74 @@ jobs:
 
       - name: Debug: Print runner_found output
         run: |
-          echo "DEBUG - runner_found: '${{ steps.check_api.outputs.runner_found }}'"
+          echo "DEBUG - runner_found: '$RUNNER_FOUND'"
+        env:
+          RUNNER_FOUND: ${{ steps.check_api.outputs.runner_found }}
 
   build:
     needs: [check-limit, check_runner_availability]
     if: ${{ needs.check-limit.outputs.authorized == 'true' && needs.check-limit.outputs.limit_reached == 'false' && needs.check_runner_availability.outputs.runner_available == 'true' }}
     runs-on: self-hosted
     timeout-minutes: 360
-    env:
-      BRAND: ${{ inputs.BRAND }}
-      CODENAME: ${{ inputs.CODENAME }}
-      TYPE: ${{ inputs.TYPE }}
-      VARIANT: ${{ inputs.VARIANT }}
-      BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
+    continue-on-error: true
+    outputs:
+      self_hosted_build_succeeded: ${{ job.status == 'success' }}
     steps:
-      - name: Debug Conditions
-        run: |
-          echo "Authorized: ${{ needs.check-limit.outputs.authorized }}"
-          echo "Limit Reached: ${{ needs.check-limit.outputs.limit_reached }}"
-          echo "Runner Available: ${{ needs.check_runner_availability.outputs.runner_available }}"
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      # Add real build steps below...
+      - name: Init and Sync
+        run: bash resync.sh
+
+      - name: Clone Repositories
+        run: bash clone.sh
+
+      - name: Set flags
+        run: bash misc/flags.sh
+
+      - name: Build RisingOS
+        run: bash build.sh
+
+      - name: Upload Build Files to Gofile
+        id: upload_files
+        if: ${{ success() }}
+        run: bash upload.sh
+
+      - name: Upload Error Log to Gofile
+        id: upload_error_log
+        if: ${{ failure() }}
+        run: bash error-log_upload.sh
+
+      - name: Post-Cleanup
+        if: ${{ always() }}
+        run: bash clean.sh
 
   fallback_crave_build:
     needs: [check-limit, check_runner_availability, build]
     if: |
-      needs.check-limit.result != 'success' ||
-      needs.check_runner_availability.result != 'success' ||
-      needs.check_runner_availability.outputs.runner_available != 'true' ||
-      needs.build.result != 'success'
+      ${{ needs.check-limit.result != 'success' }} ||
+      ${{ needs.check_runner_availability.outputs.runner_available == 'false' }} ||
+      (always() && needs.build.result != 'success')
     runs-on: ubuntu-latest
     steps:
-      - name: Debug: Print fallback inputs
+      - name: Send Telegram Notification for Fallback Trigger
         run: |
-          echo "check-limit.result: '${{ needs.check-limit.result }}'"
-          echo "check_runner_availability.result: '${{ needs.check_runner_availability.result }}'"
-          echo "runner_available: '${{ needs.check_runner_availability.outputs.runner_available }}'"
-          echo "build.result: '${{ needs.build.result }}'"
+          WORKFLOW_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MESSAGE_DISPATCH="⚠️ Attempting fallback build for ${{ inputs.CODENAME }} on Crave AOSP Builder.\nReason: self-hosted runner not available or failed.\nOriginal Workflow: [link](${WORKFLOW_RUN_URL})"
+          bash telegram_notify.sh "$MESSAGE_DISPATCH" "${{ secrets.TELEGRAM_BOT_TOKEN }}" "${{ secrets.TELEGRAM_CHAT_ID }}" "${{ secrets.TELEGRAM_THREAD_ID }}"
+
+      - name: Dispatch workflow to Crave AOSP Builder
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          repository: BashidAkhtan/RisingOS-Revived_Crave-Builder
+          event: start-RisingOS-Revived-build
+          client-payload: |
+            {
+              "codename": "${{ inputs.CODENAME }}",
+              "brand": "${{ inputs.BRAND }}",
+              "variant": "${{ inputs.VARIANT }}",
+              "type": "${{ inputs.TYPE }}",
+              "trigger_repo": "${{ github.repository }}",
+              "trigger_run_id": "${{ github.run_id }}"
+            }
